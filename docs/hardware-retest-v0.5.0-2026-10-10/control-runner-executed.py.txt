@@ -1,0 +1,164 @@
+"""SDK 0.5.0独立台架复测；仅用现有公开C API，不启动AF。"""
+import sys, json, time, math, datetime
+from pathlib import Path
+sys.dont_write_bytecode = True
+sys.path.insert(0, '/Users/panhuijuan/motor/uniubi_motor_sdk/controllers')
+from hardware_validation import Session, PD, Frame, c, read_only
+
+class GuardedSession(Session):
+    def __init__(self, device, report):
+        self.origin = None
+        self.active = False
+        super().__init__(device, report)
+        self.ser.timeout = 0.002
+    def receive(self, duration):
+        replies = super().receive(duration)
+        if self.active:
+            for r in replies:
+                if r['id'] != self.motor.joint_id or r['kind'] not in (0,1): continue
+                self.report.setdefault('motion_samples', []).append(r)
+                d=r['data']; full=r['kind']==1
+                p=d['output_position_rad' if full else 'position_rad']
+                v=d['output_velocity_rad_s' if full else 'velocity_rad_s']
+                bad=(not math.isfinite(p) or not math.isfinite(v) or abs(p-self.origin)>0.035 or abs(v)>0.15)
+                bad |= d['ntc_temperature_c']>45 if full else bool(d['status_bits'] & 0xFE) or not 30<=d['bus_voltage_v']<=60
+                if bad:
+                    self.lib.u6913_disable(c.byref(self.motor))
+                    raise RuntimeError(f'Guard stop: {r}')
+        return replies
+    def command(self, name, expected, *args, timeout=None, node=None):
+        self.receive(0.002 if self.active else 0.02)
+        rc=getattr(self.lib,'u6913_'+name)(c.byref(self.motor),*args)
+        if rc: raise RuntimeError(f'{name}: SDK error {rc}')
+        replies=self.receive(timeout if timeout is not None else (0.012 if self.active else 0.12))
+        matches=[r for r in replies if r['id']==(node or self.motor.joint_id) and r['command']==expected]
+        if not matches: raise TimeoutError(f'{name}: no reply {expected:02X}, {replies}')
+        return matches[-1]
+    def pd(self, target):
+        targets=(PD*6)();targets[self.motor.joint_id-1]=PD(*target);frame=Frame()
+        assert self.lib.u6913_build_pd(c.byref(frame),targets)==0
+        self.receive(0.002 if self.active else 0.02)
+        assert self.lib.u6913_send_frame(c.byref(self.motor),c.byref(frame))==0
+        replies=self.receive(0.012 if self.active else 0.12)
+        matches=[r for r in replies if r['id']==self.motor.joint_id and r['command']==0xAE]
+        if not matches: raise TimeoutError('AE no reply')
+        return matches[-1]
+    def stop(self):
+        rc=self.lib.u6913_disable(c.byref(self.motor));self.active=False
+        if rc: raise RuntimeError(f'FD send failed {rc}')
+        self.receive(0.3)
+        self.command('disable',0xFD)
+        r=self.command('request_standard_status',0xCB)
+        if r['data']['status_bits']!=0 or abs(r['data']['velocity_rad_s'])>0.05:
+            raise RuntimeError(f'Not disabled/stationary/fault-free: {r}')
+        return r
+
+def record(report,name,data):
+    report.setdefault('cases',[]).append({'name':name,'result':'PASS','evidence':data})
+    print(name,json.dumps(data,ensure_ascii=False),flush=True)
+
+def run(s,r):
+    read_only(s,r,extended=True)
+    if len(r['discovery'])!=1: raise RuntimeError('Requires exactly one discovered motor')
+    original_id=r['discovery'][0]['id'];s.select(original_id)
+    baseline=r['baseline'][str(original_id)];initial_mode=baseline['full']['data']['mode']
+    s.origin=baseline['full']['data']['output_position_rad'];r['origin_rad']=s.origin
+    r['limits']={'authorized_half_range_rad':0.05,'guard_half_range_rad':0.035,'guard_speed_rad_s':0.15}
+    def observe(duration,mode):
+        out=[];end=time.monotonic()+duration
+        while time.monotonic()<end:
+            q=s.command('request_standard_status',0xCB)
+            if q['data']['status_bits']!=1: raise RuntimeError(f'Enable lost/fault: {q}')
+            q=s.command('request_status',0xFE)
+            if q['data']['mode']!=mode: raise RuntimeError('Mode mismatch')
+            out.append(q)
+        return out
+    def enable(mode):
+        s.active=True
+        ack=s.command('enable',0xFC)
+        end=time.monotonic()+0.5
+        while time.monotonic()<end:
+            q=s.command('request_standard_status',0xCB)
+            if q['data']['status_bits']==1:
+                record(r,f'FC mode {mode}',{'ack':ack,'enabled':q});return
+        raise RuntimeError('Enable timed out')
+    try:
+        record(r,'FD initial',s.stop())
+        # F4设置的速度环扭矩限幅亦用于位置模式，核对过电机固件共享PI字段。
+        s.command('set_mode',0xF0,0)
+        s.command('speed_control',0xF4,0.0,0.2)
+        for mode,label in ((0,'F4 speed'),(1,'F5 position'),(2,'F1 torque'),(3,'AE PD')):
+            s.command('set_mode',0xF0,mode)
+            before=s.command('request_status',0xFE)
+            if before['data']['mode']!=mode: raise RuntimeError('F0 mode mismatch')
+            record(r,f'F0 mode {mode}',before)
+            p=before['data']['output_position_rad']
+            if mode==0: s.command('speed_control',0xF4,0.0,0.2)
+            elif mode==1: s.command('position_control',0xF5,p,0.04)
+            elif mode==2: s.command('torque_control',0xF1,0.0)
+            else: s.pd((p,0.,3.,0.15,0.))
+            enable(mode);legs=[]
+            for sign in (1,-1):
+                if mode==0:
+                    target=sign*0.02;ack=s.command('speed_control',0xF4,target,0.2);samples=observe(0.3,mode)
+                elif mode==1:
+                    target=s.origin+sign*0.012;ack=s.command('position_control',0xF5,target,0.04);samples=observe(1.2,mode)
+                elif mode==2:
+                    target=sign*0.015;ack=s.command('torque_control',0xF1,target);samples=observe(0.1,mode)
+                    s.command('torque_control',0xF1,0.0)
+                else:
+                    target=s.origin+sign*0.012;ack=s.pd((target,0.,3.,0.15,0.));samples=observe(0.8,mode)
+                legs.append({'target':target,'ack':ack,'samples':samples})
+            if mode==0:s.command('speed_control',0xF4,0.0,0.2)
+            elif mode==1:s.command('position_control',0xF5,s.origin,0.04)
+            elif mode==2:s.command('torque_control',0xF1,0.0)
+            else:s.pd((s.origin,0.,3.,0.15,0.))
+            observe(0.15,mode)
+            r.setdefault('active_mode_evidence',{})[str(mode)]=legs
+            record(r,label+' command/feedback only',{'targets':[l['target'] for l in legs],
+                'end_positions':[l['samples'][-1]['data']['output_position_rad'] for l in legs],
+                'end_iq_targets':[l['samples'][-1]['data']['iq_target_a'] for l in legs]})
+            record(r,f'FD stop mode {mode}',s.stop())
+        # ID双向变更：无复位指令，通过新ID版本和SN核对同一物理设备。
+        new_id=2 if original_id!=2 else 1
+        try:
+            s.command('set_can_id',0xFB,new_id,node=new_id);s.select(new_id);s.receive(0.8)
+            identity=s.command('request_serial_number',0xE8)
+            if identity['data']['serial_number']!=baseline['identity']['data']['serial_number']:
+                raise RuntimeError('SN mismatch at new ID')
+            record(r,'FB new ID',{'id':new_id,'identity':identity})
+        finally:
+            # 地址更改ACK可能丢失；向两个候选地址均发送原ID，避免留在临时ID。
+            s.select(new_id);s.lib.u6913_set_can_id(c.byref(s.motor),original_id);s.receive(0.2)
+            s.select(original_id);s.command('set_can_id',0xFB,original_id);s.receive(0.8)
+        record(r,'FB original ID restored',s.command('request_serial_number',0xE8))
+        s.stop();before=s.command('request_status',0xFE)
+        ack=s.command('set_zero',0xEF);s.receive(1.0);after=s.command('request_status',0xFE)
+        if abs(after['data']['output_position_rad'])>0.002:raise RuntimeError('EF zero mismatch')
+        record(r,'EF set zero (no reset persistence test)',{'before':before,'ack':ack,'after':after})
+    finally:
+        r['final_state']=s.stop()
+        # 使用现有接口留下零速度/零扭矩、当前位置保持目标、低速限矩；不猜测旧参数。
+        s.command('set_mode',0xF0,0);s.command('speed_control',0xF4,0.,0.2)
+        s.command('set_mode',0xF0,2);s.command('torque_control',0xF1,0.)
+        p=s.command('request_status',0xFE)['data']['output_position_rad']
+        s.command('set_mode',0xF0,3);s.pd((p,0.,3.,0.15,0.))
+        s.command('set_mode',0xF0,1);s.command('position_control',0xF5,p,0.04)
+        s.command('set_mode',0xF0,initial_mode)
+        r['final_state']=s.stop();r['final_full']=s.command('request_status',0xFE)
+        r['final_identity']=s.command('request_serial_number',0xE8)
+        r['final_calibration']=s.command('request_calibration_status',0xE1)
+        r['configuration_note']='保留新零位和原ID/模式；运行时速度环限矩请求0.2Nm、位置限速0.04rad/s、PD Kp3/Kd0.15。SDK无参数读写接口，未声称原限幅/增益恢复。'
+
+r={'started':datetime.datetime.now().astimezone().isoformat(),'sdk_version':'0.5.0','port':'/dev/cu.usbmodem5C843882941','traffic':[]}
+s=None
+try:
+    s=GuardedSession(r['port'],r);run(s,r);r['result']='PASS_WITH_LIMITATIONS'
+except BaseException as exc:
+    r['result']='FAIL';r['error']=repr(exc);raise
+finally:
+    if s:
+        try:r['exit_disabled']=s.stop()
+        except Exception as exc:r['exit_cleanup_error']=repr(exc)
+        finally:s.close()
+    Path('/tmp/uniubi-sdk-v050-control-retest.json').write_text(json.dumps(r,ensure_ascii=False,indent=2))

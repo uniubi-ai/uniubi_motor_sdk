@@ -1,0 +1,7 @@
+{
+  "include/uniubi6913.h": "ca509553f86caebabba959a25b3ed9a794628c45a26ea080ea9a03e589926f43",
+  "include/uniubi6913_board.h": "7cead9aba1324bdcf2a243e91d850fde6882ff133012ada4191ec7d42e2b70de",
+  "controllers/uniubi6913.c": "7d8537634d4f1624641c3830b8907488e82bad84046e5f35784fe82e8ba9d944",
+  "controllers/uniubi6913_board.c": "9dbabd49cc8d735c3a7e3698e5a750122dfa945d20a5bb7c39c98eff86434dd6",
+  "controllers/hardware_validation.py": "487c1c01316bab2ecea35f0e7d4296fc87ccd253f26fc6763be01c21ca38fe96"
+}

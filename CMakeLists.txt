@@ -1,0 +1,41 @@
+cmake_minimum_required(VERSION 3.16)
+project(uniubi6913_sdk VERSION 0.5.0 LANGUAGES C)
+
+add_library(uniubi6913 STATIC controllers/uniubi6913.c controllers/uniubi6913_board.c)
+target_include_directories(uniubi6913 PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+set_target_properties(uniubi6913 PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED YES C_EXTENSIONS NO)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(uniubi6913 PRIVATE -Wall -Wextra -Wpedantic -Werror)
+endif()
+
+option(U6913_BUILD_EXAMPLES "Build host dry-run example" ON)
+if(U6913_BUILD_EXAMPLES)
+    add_executable(uniubi6913_demo examples/host_demo.c)
+    target_link_libraries(uniubi6913_demo PRIVATE uniubi6913)
+    add_executable(uniubi6913_board_demo examples/board_demo.c)
+    target_link_libraries(uniubi6913_board_demo PRIVATE uniubi6913)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(test_uniubi6913 tests/test_uniubi6913.c)
+    target_link_libraries(test_uniubi6913 PRIVATE uniubi6913)
+    add_test(NAME protocol COMMAND test_uniubi6913)
+    add_executable(test_identity_calibration tests/test_identity_calibration.c)
+    target_link_libraries(test_identity_calibration PRIVATE uniubi6913)
+    add_test(NAME identity_calibration COMMAND test_identity_calibration)
+    add_executable(test_board tests/test_board.c)
+    target_link_libraries(test_board PRIVATE uniubi6913)
+    add_test(NAME board_transport COMMAND test_board)
+
+    add_executable(test_stm32_port tests/test_stm32_port.c ports/stm32/uniubi6913_stm32.c)
+    target_include_directories(test_stm32_port PRIVATE ports/stm32 tests/stubs)
+    target_compile_definitions(test_stm32_port PRIVATE U6913_STM32_HAL_HEADER="mock_hal.h")
+    target_link_libraries(test_stm32_port PRIVATE uniubi6913)
+    add_test(NAME stm32_port_contract COMMAND test_stm32_port)
+endif()
+
+install(TARGETS uniubi6913 ARCHIVE DESTINATION lib)
+install(FILES include/uniubi6913.h include/uniubi6913_board.h DESTINATION include)
