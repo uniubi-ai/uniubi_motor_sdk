@@ -14,7 +14,7 @@ from hardware_validation import Session, read_only, Feedback, U8, c, plain
 
 class ReadOnlyValidationTests(unittest.TestCase):
     def test_recorded_feedback_with_current_c_library(self):
-        history = json.loads((SDK / "docs/hardware-validation-2026-10-10/read-only.json").read_text())
+        history = json.loads((SDK / "tests/records/hardware-validation-2026-10-10/read-only.json").read_text())
         chunks = [bytes.fromhex(x["hex"]) for x in history["traffic"] if x.get("direction") == "RX"]
         port = Mock()
         port.in_waiting = 4096
