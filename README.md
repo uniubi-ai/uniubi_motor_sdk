@@ -6,7 +6,7 @@ UNIUBI6913 关节电机对外接入库，版本 `0.5.0`，采用 C99 标准编�
 
 支持两种接入方式：
 
-- **CAN FD 主控直连电机**：实现发送回调，将收到的帧交给 SDK 解析；STM32 用户可使用随库提供的 FDCAN 适配接口。
+- **CAN FD 主控直连电机**：实现发送回调，将收到的帧交给 SDK 解析。
 - **电脑通过 USB 调试板连接电机**：使用串口适配接口，见 [USB 串口接入](docs/debug-board.md)。
 
 建议先运行报文示例，再接入收发接口查询版本和状态，最后配置运动模式并使能电机。
@@ -66,7 +66,6 @@ uniubi_motor_sdk/
 ├── include/uniubi6913_board.h        调试板主机侧串口 API
 ├── controllers/uniubi6913.c          协议构帧、发送封装、反馈解析
 ├── controllers/uniubi6913_board.c    A8/A0/AC 封装及字节流解析
-├── ports/stm32/                      STM32 HAL FDCAN 适配参考
 ├── examples/host_demo.c              无硬件报文打印示例
 ├── examples/board_demo.c             无硬件串口报文打印示例
 ├── tests/                           单元测试与测试记录
@@ -94,7 +93,7 @@ cc -std=c99 -Wall -Wextra -Iinclude controllers/uniubi6913.c examples/host_demo.
 /tmp/uniubi6913_demo
 ```
 
-示例仅打印查询帧，并解析一条模拟版本反馈，不打开 CAN 设备。`cmake --install build --prefix <目录>` 可安装静态库和公共头文件。嵌入式工程可以直接加入 `controllers/uniubi6913.c` 和 `include/`；核心不依赖 HAL、Python、操作系统、堆分配或本仓库其他模块。需要 IEEE-754 32 位 `float`，不要启用 `-ffast-math`/`-ffinite-math-only`，否则可能破坏 NaN/Inf 校验。
+示例仅打印查询帧，并解析一条模拟版本反馈，不打开 CAN 设备。`cmake --install build --prefix <目录>` 可安装静态库和公共头文件。嵌入式工程可以直接加入 `controllers/uniubi6913.c` 和 `include/`；核心不依赖特定芯片驱动、Python、操作系统、堆分配或本仓库其他模块。需要 IEEE-754 32 位 `float`，不要启用 `-ffast-math`/`-ffinite-math-only`，否则可能破坏 NaN/Inf 校验。
 
 ## 接入发送与接收
 
@@ -170,28 +169,16 @@ if (rc == U6913_OK) rc = u6913_send_frame(&motor, &frame);
 
 上述数值仅说明 API，实际目标需由应用根据当前位置和负载生成。所有目标节点须先进入 PD 模式。无目标节点的槽也编码零目标：`00 80 00 80 00 00 00 00 00 80`，避免全零字节被解码为负端量程。
 
-## STM32 FDCAN
+## CAN FD 主控接入要求
 
-加入 `ports/stm32/uniubi6913_stm32.c` 及其头文件搜索路径，按 MCU 选择 HAL 头文件（默认 `stm32g4xx_hal.h`，可定义 `U6913_STM32_HAL_HEADER` 覆盖）。使用静态或长期有效的端口/句柄：
+主控使用支持 CAN FD 的 MCU 或外部控制器，并支持 64 字节数据帧。应用负责初始化时钟、引脚、收发器、终端电阻、过滤器、收发缓冲及控制器。通信使用标准 11 位 ID，启用 BRS，仲裁段 **1 Mbps**、数据段 **5 Mbps**；具体配置须与电机固件和硬件匹配。
 
-```c
-#include "uniubi6913_stm32.h"
-static u6913_motor_t motor;
-static u6913_stm32_port_t port;
+1. 实现 `u6913_send_fn` 回调，将 `u6913_frame_t` 的 CAN ID、数据长度及载荷交给驱动。若驱动异步发送，须复制帧内容后再返回。
+2. 调用 `u6913_init`，传入节点 ID、发送回调和驱动上下文。
+3. 收到标准 CAN FD 数据帧后，将驱动的 DLC 转换为实际字节数，再调用 `u6913_parse_feedback`。SDK 支持 12、32、48 字节反馈，收发缓冲应能容纳 64 字节。
+4. 先查询版本和状态确认通信，再按运动控制顺序操作电机。
 
-int motor_init(FDCAN_HandleTypeDef *hfdcan)
-{
-    port.hfdcan = hfdcan;
-    port.bit_rate_switch = FDCAN_BRS_ON;
-    return u6913_init(&motor, 1, u6913_stm32_send, &port);
-}
-```
-
-CubeMX/应用负责时钟、引脚、CAN FD 收发器、终端、位时序、过滤器、Message RAM、FIFO 和 `HAL_FDCAN_Start`。CAN FD 通信速率为仲裁段 **1 Mbps**、数据段 **5 Mbps**；须匹配实际固件与硬件，SDK 不硬编码寄存器时序。Tx/Rx 数据区均须能容纳 64 字节。
-
-`HAL_FDCAN_GetRxMessage` 取出 `header` 和 64 字节接收缓冲后，用 `u6913_stm32_parse` 处理 DLC 和帧类型。端口支持本 SDK 已实现的 12/32/48 字节反馈；其他扩展反馈尚未支持。
-
-主控需使用支持 CAN FD 的 MCU 或外部控制器，并支持 64 字节数据帧。接入后应使用所选 Cube HAL 版本编译，并在目标硬件验证收发。
+通过 USB 调试板连接时，应用使用串口收发接口，CAN FD 转发由调试板完成，见 [USB 串口接入](docs/debug-board.md)。
 
 ## 单位与错误处理
 
